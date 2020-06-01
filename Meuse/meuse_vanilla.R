@@ -1,5 +1,5 @@
 options(stringsAsFactors = F)
-source("../esf_funcs.R")
+source("../lag_funcs.R")
 
 # Data ----
 library(ggplot2)
@@ -41,12 +41,10 @@ inner <- lapply(1:length(outer.rin$train.inds), function(i) {
   list(train.inds = inner.rin$train.inds, test.inds = inner.rin$test.inds)
 })
 
-
 # Spatial CV: evaluation ----
 library(glmnet)
 library(FNN)
 library(ranger)
-library(spmoran)
 
 res <- lapply(1:outer_n, function(oi) {
   res.rmse <- NULL
@@ -56,16 +54,16 @@ res <- lapply(1:outer_n, function(oi) {
     cv.res <- lapply(1:inner_n, function(cvi) {
       hold_eval(param = params[i],
                 train.id = inner[[oi]]$train.inds[[cvi]], test.id = inner[[oi]]$test.inds[[cvi]], 
-                target.var = "zinc", data.sf = meuse.sf, lasso.fold = 10, prox = FALSE)
+                target.var = "zinc", data.sf = meuse.sf, spatial = F)
     })
     res.rmse[i] <- aggregate(unlist(cv.res), by = list(rep(1:4, times = inner_n)), mean)[3, 2]
   }
   print(paste0("Done: inner tuning of outer fold ", oi))
   flush.console()
   # outer eval
-  rmse.outer <- unlist(hold_eval(param = params[which.min(res.rmse)],
-                                 train.id = outer.rin$train.inds[[oi]], test.id = outer.rin$test.inds[[oi]], 
-                                 target.var = "zinc", data.sf = meuse.sf, lasso.fold = 10, prox = FALSE))
+  rmse.outer <- unlist(hold_eval(param = params[which.min(res.rmse)], 
+                          train.id = outer.rin$train.inds[[oi]], test.id = outer.rin$test.inds[[oi]], 
+                          target.var = "zinc", data.sf = meuse.sf, spatial = F))
   print(paste0("Done: outer fold ", oi, ". RMSE: ", rmse.outer[3]))
   flush.console()
   return(rmse.outer)
@@ -86,30 +84,22 @@ rm(rdesc, spatial.task)
 params <- 2:7
 tune.res <- sapply(1:length(params), function(i) {
   cv.res <- lapply(1:5, function(cvi) {
-    hold_eval(param = params[i], 
+    hold_eval(param = params[i],
               train.id = tune.rin$train.inds[[cvi]], test.id = tune.rin$test.inds[[cvi]], 
-              target.var = "zinc", data.sf = meuse.sf, lasso.fold = 10, 
-              prox = FALSE, spatial = T)
+              target.var = "zinc", data.sf = meuse.sf, spatial = F)
   })
   aggregate(unlist(cv.res), by = list(rep(1:4, times = 5)), mean)[3, 2]
 })
-params[which.min(tune.res)]
+
 
 # Final model: training ----
-train.esfs <- meigen_full(as.matrix(st_coordinates(meuse.sf)))
-esf.coef <- esf_coeffs(train.esfs$sf, meuse.sf$zinc, 
-                       as.data.frame(st_coordinates(meuse.sf)), folds = 10)
-esfsub <- as.data.frame(train.esfs$sf)[, esf.coef != 0, drop=FALSE]
-# Combine the original features with esf eigenvectors
-meuse.final <- dplyr::bind_cols(meuse.sf, esfsub)
-
-# Use the parameter setting with the lowest RMSE
 set.seed(1111)
-final.model <- ranger::ranger(x = dplyr::select(st_drop_geometry(meuse.final), -c("zinc")), 
+final.model <- ranger::ranger(x = dplyr::select(st_drop_geometry(meuse.sf), -c("zinc")), 
                               y = meuse.sf$zinc, 
                               mtry = params[which.min(tune.res)], num.trees = 200, num.threads = 2)
-pred <- predict(final.model, dplyr::select(st_drop_geometry(meuse.final), -c("zinc"))) %>% ranger::predictions()
-rmse.train <- ModelMetrics::rmse(actual = meuse.final$zinc, predicted = pred)
+
+pred <- predict(final.model, dplyr::select(st_drop_geometry(meuse.sf), -c("zinc"))) %>% ranger::predictions()
+rmse.train <- ModelMetrics::rmse(actual = meuse.sf$zinc, predicted = pred)
 
 
 # Final model: Moran ----
