@@ -1,7 +1,7 @@
 options(stringsAsFactors = F)
 
 # Lag helper funcs
-source("../esf_funcs.R")
+source("../lag_funcs.R")
 
 # Data ----
 library(ggplot2)
@@ -22,6 +22,7 @@ library(mlr)
 outer_n <- 5
 inner_n <- 3
 cvmethod <- "SpCV" # "CV"
+
 set.seed(123) # Set seeds
 # Resampling description (outer folds)
 rdesc <- makeResampleDesc(cvmethod, iters = outer_n)
@@ -49,7 +50,6 @@ inner <- lapply(1:length(outer.rin$train.inds), function(i) {
 library(glmnet)
 library(FNN)
 library(ranger)
-library(spmoran)
 library(foreach)
 library(parallel)
 library(doParallel)
@@ -58,28 +58,30 @@ library(doParallel)
 cl <- makeCluster(detectCores()-1)
 registerDoParallel(cl)
 
-res <- lapply(1:outer_n, function(oi) {
-  # inner folds eval
-  params <- 2:8 # 'mtry' candidates
-  ex_pkgs <- c("sf", "spmoran", "ModelMetrics", "caret", "ranger", "dplyr", "glmnet", "mlr")
+res.plain <- lapply(1:outer_n, function(oi) {
+  # Inner folds eval
+  params <- 2:6 # 'mtry' candidates
+  ex_pkgs <- c("sf", "FNN", "ModelMetrics", "caret", "ranger", "dplyr", "glmnet", "mlr")
   vars <- c(ls(), ls(envir = globalenv()))
   res.rmse <- lapply(1:length(params), function(i){
+    # 'spatial' argument is set to false!
     cv.res <- foreach(cvi = 1:inner_n, .combine = "c", 
                       .packages = ex_pkgs, .export = vars) %dopar%{
-                        hold_eval(param = params[i],  
-                                  train.id = inner[[oi]]$train.inds[[cvi]], 
+                        hold_eval(param = params[i], train.id = inner[[oi]]$train.inds[[cvi]], 
                                   test.id = inner[[oi]]$test.inds[[cvi]], 
-                                  target.var = "houseValue", data.sf = housing.sf, lasso.fold = 10,
-                                  prox = T, spatial = TRUE)
+                                  target.var = "houseValue", 
+                                  data.sf = housing.sf, spatial = FALSE)
                       }
+    # Outer eval
     aggregate(unlist(cv.res), by = list(rep(1:4, times = inner_n)), mean)[3, 2]
   })
   print(paste0("Done: inner tuning of outer fold ", oi))
   flush.console()
   # outer eval
   rmse.outer <- unlist(hold_eval(param = params[which.min(res.rmse)],
-                                 train.id = outer.rin$train.inds[[oi]], test.id = outer.rin$test.inds[[oi]], 
-                                 target.var = "houseValue", data.sf = housing.sf, lasso.fold = 10, prox = T))
+                                 train.id = outer.rin$train.inds[[oi]], 
+                                 test.id = outer.rin$test.inds[[oi]], 
+                                 target.var = "houseValue", data.sf = housing.sf, spatial = FALSE))
   print(paste0("Done: outer fold ", oi, ". RMSE: ", rmse.outer[3]))
   flush.console()
   return(rmse.outer)
@@ -87,10 +89,10 @@ res <- lapply(1:outer_n, function(oi) {
 stopCluster(cl)
 
 # Average results from outer folds
-avg.nested <- aggregate(unlist(res), by = list(rep(1:4, times = outer_n)), mean)[3, 2]
+avg.nested <- aggregate(unlist(res.plain), by = list(rep(1:4, times = outer_n)), mean)[3, 2]
 
 
-# Final esf model: tuning ----
+# Final non-spatial model: tuning ----
 # 5-fold spatial CV
 set.seed(456)
 rdesc <- makeResampleDesc(cvmethod, iters = 5)
@@ -100,52 +102,44 @@ tune.rin <- makeResampleInstance(rdesc, task = spatial.task)
 rm(rdesc, spatial.task)
 
 params <- 2:6 # 'mtry' candidates
-ex_pkgs <- c("sf", "spmoran", "ModelMetrics", "caret", "ranger", "dplyr", "glmnet", "mlr")
+ex_pkgs <- c("sf", "FNN", "ModelMetrics", "caret", "ranger", "dplyr", "glmnet", "mlr")
 
 cl <- makeCluster(detectCores()-1)
 registerDoParallel(cl)
 tune.res <- sapply(1:length(params), function(i) {
   vars <- c(ls(), ls(envir = globalenv()))
-  cv.res <- foreach(cvi = 1:outer_n, .combine = "c", 
+  cv.res <- foreach(cvi = 1:5, .combine = "c", 
                     .packages = ex_pkgs, .export = vars) %dopar%{
-                      hold_eval(params[i],  
+                      hold_eval(params[i], 
                                 train.id = tune.rin$train.inds[[cvi]], 
                                 test.id = tune.rin$test.inds[[cvi]], 
                                 target.var = "houseValue", data.sf = housing.sf, 
-                                lasso.fold = 10, prox = T, spatial = TRUE)
+                                lasso.fold = 10, spatial = FALSE)
                     }
   # Averaging the testing RMSE
   aggregate(unlist(cv.res), by = list(rep(1:4, times = 5)), mean)[3, 2]
 })
 stopCluster(cl)
 
+params[which.min(tune.res)]
 
-# Final esf model: training ----
-train.esfs <- meigen_f(as.matrix(st_coordinates(housing.sf)))
-esf.coef <- esf_coeffs(train.esfs$sf, housing.sf$houseValue, 
-                       as.data.frame(st_coordinates(housing.sf)), folds = 10)
-esfsub <- as.data.frame(train.esfs$sf)[, esf.coef != 0, drop=FALSE]
-# Combine the original features with esf eigenvectors
 
-housing.final <- dplyr::bind_cols(housing.sf, esfsub)
-
-# Use the parameter setting with the lowest RMSE
+# Final model: training ----
 set.seed(1111)
-final.model <- ranger::ranger(x = dplyr::select(st_drop_geometry(housing.final), -c("houseValue")), 
-                              y = housing.final$houseValue, 
+final.model <- ranger::ranger(x = dplyr::select(st_drop_geometry(housing.sf), -c("houseValue")), 
+                              y = housing.sf$houseValue, 
                               mtry = params[which.min(tune.res)], num.trees = 200, num.threads = 2)
 
-pred <- predict(final.model, dplyr::select(st_drop_geometry(housing.final), -c("houseValue"))) %>% ranger::predictions()
-rmse.train <- ModelMetrics::rmse(actual = housing.final$houseValue, predicted = pred)
+pred <- predict(final.model, dplyr::select(st_drop_geometry(housing.sf), -c("houseValue"))) %>% ranger::predictions()
+rmse.train <- ModelMetrics::rmse(actual = housing.sf$houseValue, predicted = pred)
 
-
-# Final lag model: Moran ----
+# Final model: Moran ----
 library(spdep)
 # Creating neighboring list
 nb <- FNN::get.knn(as.matrix(st_coordinates(housing.sf)), 5)$nn.index %>% 
   apply(1, list) %>% unlist(recursive = F)
 attr(nb, "class") <- "nb"
 # Moran's I (1000 Monte-Carlo simulation)
-moran.mc(housing.sf$houseValue - pred, nb2listw(nb), nsim = 999)
+mc <- moran.mc(housing.sf$houseValue - pred, nb2listw(nb), nsim = 999)
 
 
